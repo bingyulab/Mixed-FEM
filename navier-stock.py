@@ -11,8 +11,6 @@ from dolfinx import mesh, fem
 import basix.ufl
 import ufl
 from mpi4py import MPI
-import petsc4py.PETSc as PETSc
-import slepc4py.SLEPc as SLEPc
 
 # Optional visualization
 try:
@@ -37,7 +35,7 @@ def wall(x: np.ndarray) -> np.ndarray:
     return np.logical_or(
         x[1] < 0 + np.finfo(float).eps, x[1] > 1 - np.finfo(float).eps)
 
-def get_function_spaces(case: str, msh: mesh.Mesh):
+def get_function_spaces(case: str, msh: dolfinx.mesh.Mesh):
     """
     Define function spaces for different velocity-pressure element pairings.
     
@@ -48,6 +46,7 @@ def get_function_spaces(case: str, msh: mesh.Mesh):
     Returns:
         Tuple of (velocity_space, pressure_space)
     """
+    from dolfinx import mesh, fem
     if case == "P2_x_P1":
         # Taylor-Hood elements (stable)
         V = fem.functionspace(
@@ -66,7 +65,7 @@ def get_function_spaces(case: str, msh: mesh.Mesh):
         )
         Q = fem.functionspace(
             msh, 
-            basix.ufl.element("Discontinuous Lagrange", msh.basix_cell(), 1)
+            basix.ufl.element("Lagrange", msh.basix_cell(), 1)
         )
     elif case == "BDM_x_P1":
         # Brezzi-Douglas-Marini elements (stable)
@@ -76,7 +75,7 @@ def get_function_spaces(case: str, msh: mesh.Mesh):
         )
         Q = fem.functionspace(
             msh, 
-            basix.ufl.element("Discontinuous Lagrange", msh.basix_cell(), 1)
+            basix.ufl.element("Lagrange", msh.basix_cell(), 1)
         )
     else:
         raise ValueError(f"Unknown case: {case}")
@@ -84,24 +83,6 @@ def get_function_spaces(case: str, msh: mesh.Mesh):
     print(f"Created function spaces for {case}")
     return V, Q
 
-def normalize(u1: fem.Function, u2: fem.Function, p: fem.Function) -> None:
-    """Normalize an eigenvector."""
-    scaling_operations = [
-        # Scale functions with a W^{1,1} (for velocity) or L^1 (for pressure) norm
-        (u1, lambda u: (u.dx(0) + u.dx(1)) * ufl.dx, lambda x: x),
-        (u2, lambda u: (u.dx(0) + u.dx(1)) * ufl.dx, lambda x: x),
-        (p, lambda p: p * ufl.dx, lambda x: x),
-        # Normalize functions with a H^1 (for velocity) or L^2 (for pressure) norm
-        (u1, lambda u: ufl.inner(ufl.grad(u), ufl.grad(u)) * ufl.dx, lambda x: np.sqrt(x)),
-        (u2, lambda u: ufl.inner(ufl.grad(u), ufl.grad(u)) * ufl.dx, lambda x: np.sqrt(x)),
-        (p, lambda p: ufl.inner(p, p) * ufl.dx, lambda x: np.sqrt(x))
-    ]
-    
-    for (function, bilinear_form, postprocess) in scaling_operations:
-        scalar = postprocess(MPI.COMM_WORLD.allreduce(
-            fem.assemble_scalar(fem.form(bilinear_form(function))), op=MPI.SUM))
-        function.x.petsc_vec.scale(1. / scalar if scalar != 0 else 1.0)
-        function.x.petsc_vec.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
 
 def compute_inf_sup_constant(case: str, n: int = 32) -> tuple[float, fem.Function, fem.Function, fem.Function]:
     """
@@ -120,86 +101,70 @@ def compute_inf_sup_constant(case: str, n: int = 32) -> tuple[float, fem.Functio
     msh = create_unit_square_mesh(n)
     
     # Get boundary facets
-    boundary_facets = mesh.locate_entities_boundary(msh, msh.topology.dim - 1, wall)
+    boundary_facets = dolfinx.mesh.locate_entities_boundary(msh, msh.topology.dim - 1, wall)
     
     # Create function spaces based on the specified case
     V_element, Q_element = get_function_spaces(case, msh)[0].ufl_element(), get_function_spaces(case, msh)[1].ufl_element()
     
     # Create mixed function space
-    W_element = basix.ufl.mixed_element([V_element, Q_element])
-    W = fem.functionspace(msh, W_element)
-    
-    # Test and trial functions
-    vq = ufl.TestFunction(W)
-    (v, q) = ufl.split(vq)
-    up = ufl.TrialFunction(W)
-    (u, p) = ufl.split(up)
-    
-    # Variational forms for the generalized eigenvalue problem
-    lhs = (ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx - ufl.inner(p, ufl.div(v)) * ufl.dx
-           - ufl.inner(ufl.div(u), q) * ufl.dx)
-    rhs = - ufl.inner(p, q) * ufl.dx
-    
+
+    V = dolfinx.fem.functionspace(mesh, V_element)
+    Q = dolfinx.fem.functionspace(mesh, Q_element)
+
+    (v, q) = (ufl.TestFunction(V), ufl.TestFunction(Q))
+    (u, p) = (ufl.TrialFunction(V), ufl.TrialFunction(Q))
+            
+    # Variational forms
+    lhs = [[ufl.inner(ufl.grad(u), ufl.grad(v)) * ufl.dx, - ufl.inner(p, ufl.div(v)) * ufl.dx],
+           [- ufl.inner(ufl.div(u), q) * ufl.dx, None]]
+    rhs = [[None, None],
+           [None, - ufl.inner(p, q) * ufl.dx]]
+    rhs[0][0] = dolfinx.fem.Constant(mesh, petsc4py.PETSc.ScalarType(0)) * ufl.inner(u, v) * ufl.dx
+
     # Define restriction for DOFs associated to homogenous Dirichlet boundary conditions
-    dofs_W = np.arange(0, W.dofmap.index_map.size_local + W.dofmap.index_map.num_ghosts)
-    W0 = W.sub(0)
-    V, _ = W0.collapse()
-    bdofs_V = fem.locate_dofs_topological((W0, V), msh.topology.dim - 1, boundary_facets)[0]
-    restriction = dolfinx.fem.DofMapRestriction(W.dofmap, np.setdiff1d(dofs_W, bdofs_V))
-    
+    dofs_V = np.arange(0, V.dofmap.index_map.size_local + V.dofmap.index_map.num_ghosts)
+    bdofs_V = dolfinx.fem.locate_dofs_topological(V, mesh.topology.dim - 1, boundary_facets)
+    dofs_Q = np.arange(0, Q.dofmap.index_map.size_local + Q.dofmap.index_map.num_ghosts)
+    restriction_V = multiphenicsx.fem.DofMapRestriction(V.dofmap, np.setdiff1d(dofs_V, bdofs_V))
+    restriction_Q = multiphenicsx.fem.DofMapRestriction(Q.dofmap, dofs_Q)
+    restriction = [restriction_V, restriction_Q]
+
     # Assemble lhs and rhs matrices
-    A = dolfinx.fem.petsc.assemble_matrix(
-        fem.form(lhs), restriction=(restriction, restriction))
+    A = multiphenicsx.fem.petsc.assemble_matrix_block(
+        dolfinx.fem.form(lhs), bcs=[], restriction=(restriction, restriction))
     A.assemble()
-    B = dolfinx.fem.petsc.assemble_matrix(
-        fem.form(rhs), restriction=(restriction, restriction))
+    B = multiphenicsx.fem.petsc.assemble_matrix_block(
+        dolfinx.fem.form(rhs), bcs=[], restriction=(restriction, restriction))
     B.assemble()
     
-    # Solve the eigenvalue problem
-    eps = SLEPc.EPS().create(msh.comm)
+    # Solve
+    eps = slepc4py.SLEPc.EPS().create(mesh.comm)
     eps.setOperators(A, B)
-    eps.setProblemType(SLEPc.EPS.ProblemType.GNHEP)
-    eps.setDimensions(1, PETSc.DECIDE, PETSc.DECIDE)
-    eps.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
+    eps.setProblemType(slepc4py.SLEPc.EPS.ProblemType.GNHEP)
+    eps.setDimensions(1, petsc4py.PETSc.DECIDE, petsc4py.PETSc.DECIDE)
+    eps.setWhichEigenpairs(slepc4py.SLEPc.EPS.Which.TARGET_REAL)
     eps.setTarget(1.e-5)
-    eps.getST().setType(SLEPc.ST.Type.SINVERT)
+    eps.getST().setType(slepc4py.SLEPc.ST.Type.SINVERT)
     eps.getST().getKSP().setType("preonly")
     eps.getST().getKSP().getPC().setType("lu")
     eps.getST().getKSP().getPC().setFactorSolverType("mumps")
     eps.solve()
-    
-    if eps.getConverged() < 1:
-        print(f"WARNING: Eigenvalue solver did not converge for {case}")
-        return 0.0, None, None, None
-    
+    assert eps.getConverged() >= 1
+
     # Extract leading eigenvalue and eigenvector
-    vr = dolfinx.cpp.fem.petsc.create_vector_block([(restriction.index_map, restriction.index_map_bs)])
-    vi = dolfinx.cpp.fem.petsc.create_vector_block([(restriction.index_map, restriction.index_map_bs)])
+    vr = dolfinx.cpp.fem.petsc.create_vector_block(
+        [(restriction_.index_map, restriction_.index_map_bs) for restriction_ in restriction])
+    vi = dolfinx.cpp.fem.petsc.create_vector_block(
+        [(restriction_.index_map, restriction_.index_map_bs) for restriction_ in restriction])
     eigv = eps.getEigenpair(0, vr, vi)
     r, i = eigv.real, eigv.imag
-    
-    if abs(i) > 1.e-10:
-        print(f"WARNING: Eigenvalue has significant imaginary part: {i}")
-    
-    inf_sup = np.sqrt(r) if r > 0 else 0.0
-    print(f"Inf-sup constant for {case}: {inf_sup}")
-    
-    # Transform eigenvector into eigenfunction
-    r_fun = fem.Function(W)
-    vr.ghostUpdate(addv=PETSc.InsertMode.INSERT, mode=PETSc.ScatterMode.FORWARD)
-    with r_fun.x.petsc_vec.localForm() as r_fun_local, \
-            dolfinx.fem.petsc.VecSubVectorWrapper(vr, W.dofmap, restriction) as vr_wrapper:
-        r_fun_local[:] = vr_wrapper
-    
-    u_fun = r_fun.sub(0).collapse()
-    (u_fun_1, u_fun_2) = (u_fun.sub(0).collapse(), u_fun.sub(1).collapse())
-    p_fun = r_fun.sub(1).collapse()
-    
-    # Normalize the eigenfunctions
-    normalize(u_fun_1, u_fun_2, p_fun)
-    
+    assert abs(i) < 1.e-10
+    assert r > 0., "r = " + str(r) + " is not positive"
+    print("Inf-sup constant (block): ", np.sqrt(r))
+
     eps.destroy()
-    return inf_sup, u_fun_1, u_fun_2, p_fun
+    return r
+
 
 def save_plots(case: str, u1: fem.Function, u2: fem.Function, p: fem.Function) -> None:
     """Save plots of the eigenfunctions."""
@@ -226,60 +191,67 @@ def save_plots(case: str, u1: fem.Function, u2: fem.Function, p: fem.Function) -
 
 def main():
     """Main function to run the comparison."""
-    # List of element pairings to test
     pairings = ["P2_x_P1", "RT_x_P1", "BDM_x_P1"]
     
     # List of mesh resolutions
     resolutions = [8, 16, 32]
-    
+
     # Store results
     results = {}
-    
+
     for n in resolutions:
         results[n] = {}
         for case in pairings:
             try:
-                inf_sup, u1, u2, p = compute_inf_sup_constant(case, n)
+                inf_sup = compute_inf_sup_constant(case, n)
                 results[n][case] = inf_sup
                 
-                # Save plots for the finest resolution
-                if n == max(resolutions) and u1 is not None:
-                    save_plots(case, u1, u2, p)
             except Exception as e:
                 print(f"Error computing inf-sup for {case}: {e}")
                 results[n][case] = float('nan')
-    
+
     # Print summary table
     print("\n----- Inf-Sup Constant Summary -----")
     header = "Resolution | " + " | ".join(pairings)
     print("-" * len(header))
     print(header)
     print("-" * len(header))
-    
+
     for n in resolutions:
         row = f"{n:^10} | "
         row += " | ".join(f"{results[n][case]:.6f}" if not np.isnan(results[n][case]) else "  N/A  " for case in pairings)
         print(row)
-    
+
     print("-" * len(header))
+
+    import matplotlib.pyplot as plt
+    try:
+        import scienceplots
+    except:
+        !pip install --quiet scienceplots
+        import scienceplots
+    plt.style.use(['science', 'no-latex'])
+
+    # Then continue with your plotting code
+    with plt.style.context(['science', 'no-latex']):
     
-    # Create comparison plot
-    plt.figure(figsize=(10, 6))
-    markers = ['o', 's', '^', 'D', 'v']
-    
-    for i, case in enumerate(pairings):
-        values = [results[n][case] for n in resolutions if not np.isnan(results[n][case])]
-        resols = [n for n in resolutions if not np.isnan(results[n][case])]
-        if values:
-            plt.plot(resols, values, marker=markers[i % len(markers)], label=case)
-    
-    plt.xlabel("Mesh Resolution")
-    plt.ylabel("Inf-Sup Constant")
-    plt.title("Comparison of Inf-Sup Constants for Different Element Pairings")
-    plt.grid(True)
-    plt.legend()
-    plt.savefig(output_dir / "inf_sup_comparison.png", dpi=300)
-    print(f"\nComparison plot saved to {output_dir / 'inf_sup_comparison.png'}")
+        # Create comparison plot
+        plt.figure(figsize=(10, 6))
+        markers = ['o', 's', '^', 'D', 'v']
+
+        for i, case in enumerate(pairings):
+            values = [results[n][case] for n in resolutions if not np.isnan(results[n][case])]
+            resols = [n for n in resolutions if not np.isnan(results[n][case])]
+            if values:
+                plt.plot(resols, values, marker=markers[i % len(markers)], label=case)
+
+        plt.xlabel("Mesh Resolution")
+        plt.ylabel("Inf-Sup Constant")
+        plt.title("Comparison of Inf-Sup Constants for Different Element Pairings")
+        plt.grid(True)
+        plt.legend()
+        plt.savefig(output_dir / "inf_sup_comparison.png", dpi=300)
+        print(f"\nComparison plot saved to {output_dir / 'inf_sup_comparison.png'}")
 
 if __name__ == "__main__":
     main()
