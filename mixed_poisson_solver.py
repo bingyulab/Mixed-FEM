@@ -200,7 +200,7 @@ def solve_case(case, msh):
     ksp.setOperators(A, P)
     ksp.setMonitor(lambda ksp, its, rnorm: logger.info(
         f"Iteration: {its}, residual: {rnorm}") if its % 100 == 0 else None)
-    ksp.setType("gmres")
+    ksp.setType("fgmres")
     ksp.setTolerances(rtol=1e-6, max_it=1000)
     ksp.setGMRESRestart(200)
     ksp.getPC().setType("fieldsplit")
@@ -218,7 +218,11 @@ def solve_case(case, msh):
 
     return u
 
-
+def wall(x: np.ndarray) -> np.ndarray:
+    """Determine the position of the wall."""
+    return np.logical_or(
+        x[1] < 0 + np.finfo(float).eps, x[1] > 1 - np.finfo(float).eps)
+    
 def compute_brezzi_infsup(case, msh):
     # Compute the Brezzi inf-sup constant for a given case.
     from slepc4py import SLEPc
@@ -243,19 +247,37 @@ def compute_brezzi_infsup(case, msh):
 
     dx = ufl.Measure("dx", msh)
     # Define forms for eigenvalue problem
-    lhs = ufl.inner(sigma, tau) * dx + ufl.inner(
-        u, ufl.div(tau)) * dx + ufl.inner(ufl.div(sigma), v) * dx
+    lhs = ufl.inner(sigma, tau) * dx - ufl.inner(
+        u, ufl.div(tau)) * dx - ufl.inner(ufl.div(sigma), v) * dx
     rhs = -ufl.inner(u, v) * dx
 
     # Convert to forms
     a_form = fem.form(lhs, dtype=dtype)
     b_form = fem.form(rhs, dtype=dtype)
+        
+    # Boundary conditions
+    fdim = msh.topology.dim - 1
+    # Find all boundary facets
+    boundary_facets = mesh.locate_entities_boundary(
+        msh, fdim, wall)
+
+    # Get all boundary DOFs for the vector function space
+    boundary_dofs = fem.locate_dofs_topological(V, fdim, boundary_facets)
+
+    # Create a zero function for Dirichlet BC
+    u_bc = fem.Function(V, dtype=dtype)
+    u_bc.x.array[:] = 0.0  # Set all components to zero
+
+    # Apply homogeneous Dirichlet boundary condition on all boundaries
+    bcs = [fem.dirichletbc(u_bc, boundary_dofs)]
+    logger.info(
+        "Defined homogeneous Dirichlet boundary conditions on all boundaries.")
 
     # Assemble matrices
-    A = assemble_matrix(a_form)
+    A = assemble_matrix(a_form, bcs=bcs)
     A.assemble()
 
-    B = assemble_matrix(b_form)
+    B = assemble_matrix(b_form, bcs=bcs)
     B.assemble()
 
     # Set up eigenvalue solver with shift-and-invert to avoid zero pivots
@@ -284,12 +306,10 @@ def compute_brezzi_infsup(case, msh):
     logger.info(f"Number of converged eigenvalues: {nconv}")
 
     if nconv > 0:
-        eigenvalues = [abs(eps.getEigenvalue(i).real) for i in range(nconv)]
-        eigenvalues.sort()
-        non_zero_eigvals = [ev for ev in eigenvalues if ev > 1e-10]
-
-        if non_zero_eigvals:
-            inf_sup = np.sqrt(non_zero_eigvals[0])
+        eigv = eps.getEigenvalue(0)
+        r, i = eigv.real, eigv.imag
+        if r:
+            inf_sup = np.sqrt(r)
             logger.info(f"Inf-sup constant for case {case}: {inf_sup}")
             return inf_sup
         else:
@@ -306,25 +326,17 @@ def plot_contour(u, case):
     topology, cell_types, geometry = vtk_mesh(
         u.function_space.mesh, u.function_space.mesh.topology.dim)
     values = u.x.array
-
-    min_val = u.x.array.min()
-    max_val = u.x.array.max()
-    logger.info(
-        f"Solution range for case {case}: min={min_val}, max={max_val}")
     grid = pv.UnstructuredGrid(topology, cell_types, geometry)
     grid["u"] = values
 
     # Create a plotter object for saving PNG
     plotter = pv.Plotter(off_screen=True)
-    abs_max = max(abs(min_val), abs(max_val))
     plotter.add_mesh(grid,
                      scalars="u",
                      cmap="coolwarm",
-                     show_edges=True,
-                     clim=[-abs_max, abs_max])
+                     show_edges=True) 
     plotter.add_text(
-        f"Contour Plot of u for Case {case} (min={min_val:.4f}, max={max_val:.4f})",
-        position="upper_edge")
+        f"Contour Plot of u for Case {case}", position="upper_edge")
 
     plotter.add_scalar_bar("u", vertical=True, position_x=0.85)
 
@@ -371,7 +383,7 @@ def compute_mesh_size(msh):
 if __name__ == "__main__":
     # Solve and plot all cases with different mesh sizes
     mesh_sizes = [2, 4, 8, 16, 32, 64]  # Different mesh resolutions
-    cases = ["P1_x_P1", "P1_x_P0", "RT_x_P0", "BDM_x_P0", "QUADS_x_P0"]
+    cases = ["P1_x_P1", "P1_x_P0", "RT_x_P0", "BDM_x_P0"]
     results = {
         case: {
             "mesh_size": [],
@@ -407,7 +419,7 @@ if __name__ == "__main__":
                 results[case]["inf_sup"].append(inf_sup)
 
                 # Solve the problem only for the finest mesh
-                if nx == mesh_sizes[-1]:
+                if nx == 32:
                     u_sol = solve_case(case, msh)
                     plot_contour(u_sol, case)
 
@@ -427,7 +439,7 @@ if __name__ == "__main__":
         colors = ['C0', 'C1', 'C2', 'C3']
 
         for i, case in enumerate(cases[1:]):
-            plt.subplot(2, 2, i + 1)
+            plt.subplot(1, 3, i + 1)
             if results[case]["mesh_size"] and results[case]["inf_sup"]:
                 plt.plot(results[case]["mesh_size"],
                          results[case]["inf_sup"],
