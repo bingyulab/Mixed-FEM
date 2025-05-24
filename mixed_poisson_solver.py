@@ -218,10 +218,16 @@ def solve_case(case, msh):
 
     return u
 
-def wall(x: np.ndarray) -> np.ndarray:
+def boundary(x: np.ndarray) -> np.ndarray:
     """Determine the position of the wall."""
-    return np.logical_or(
-        x[1] < 0 + np.finfo(float).eps, x[1] > 1 - np.finfo(float).eps)
+    eps = np.finfo(float).eps
+    return np.logical_or.reduce((
+        x[0] < 0 + eps,  # left wall (x=0)
+        x[0] > 1 - eps,  # right wall (x=1)
+        x[1] < 0 + eps,  # bottom wall (y=0)
+        x[1] > 1 - eps   # top wall (y=1)
+    ))
+    
     
 def compute_brezzi_infsup(case, msh):
     # Compute the Brezzi inf-sup constant for a given case.
@@ -232,7 +238,7 @@ def compute_brezzi_infsup(case, msh):
 
     # Get the function spaces
     V, W = get_function_spaces(case, msh)
-
+    
     # Create mixed function space
     mixed_element = MixedElement([V.ufl_element(), W.ufl_element()])
     Z = fem.functionspace(msh, mixed_element)
@@ -259,7 +265,7 @@ def compute_brezzi_infsup(case, msh):
     fdim = msh.topology.dim - 1
     # Find all boundary facets
     boundary_facets = mesh.locate_entities_boundary(
-        msh, fdim, wall)
+        msh, fdim, boundary)
 
     # Get all boundary DOFs for the vector function space
     boundary_dofs = fem.locate_dofs_topological(V, fdim, boundary_facets)
@@ -286,7 +292,7 @@ def compute_brezzi_infsup(case, msh):
     eps.setProblemType(
         SLEPc.EPS.ProblemType.GNHEP)  # Generalized Hermitian eigenproblem.
 
-    eps.setDimensions(1, PETSc.DECIDE, PETSc.DECIDE)
+    eps.setDimensions(10, PETSc.DECIDE, PETSc.DECIDE)
     # Set target and which eigenpairs(Smallest real parts) to compute
     eps.setWhichEigenpairs(SLEPc.EPS.Which.TARGET_REAL)
 
@@ -306,10 +312,12 @@ def compute_brezzi_infsup(case, msh):
     logger.info(f"Number of converged eigenvalues: {nconv}")
 
     if nconv > 0:
-        eigv = eps.getEigenvalue(0)
-        r, i = eigv.real, eigv.imag
-        if r:
-            inf_sup = np.sqrt(r)
+        eigenvalues = [abs(eps.getEigenvalue(i).real) for i in range(nconv)]
+        eigenvalues.sort()
+        non_zero_eigvals = [ev for ev in eigenvalues if ev > 1e-10]
+
+        if non_zero_eigvals:
+            inf_sup = np.sqrt(non_zero_eigvals[0]/(1 + non_zero_eigvals[0]))
             logger.info(f"Inf-sup constant for case {case}: {inf_sup}")
             return inf_sup
         else:
@@ -483,3 +491,4 @@ if __name__ == "__main__":
         plt.savefig("infsup_vs_meshsize_combined.png", dpi=300)
         print("Saved subplots and combined plot of h vs b_h")
         plt.close('all')
+
